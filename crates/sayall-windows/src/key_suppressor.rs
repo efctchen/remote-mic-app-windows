@@ -43,6 +43,11 @@ mod windows_impl {
 
     const ARM_GRACE_MS: u64 = 250;
     const BOUNDED_WAIT_MS: u64 = 60;
+    /// 建链保护（`link_guard`）认可"遥控器在场"的时长。`Reconnecting` 可以
+    /// 无限持续，若期间无条件吞 F5，会把**实体键盘的 F5 一起吞掉**（浏览器
+    /// 刷新失效、记事本插入时间失效）。因此只有这段时间内 Raw Input 确实
+    /// 观察到遥控器设备报文时，才允许借 `link_guard` 吞 F5。
+    const REMOTE_ACTIVITY_WINDOW_MS: u64 = 3000;
     /// 遥控器语音键在键盘层的虚拟键码（F5）；宿主进程的按键过滤共用。
     pub(crate) const VK_F5: u32 = 0x74;
 
@@ -58,6 +63,11 @@ mod windows_impl {
     static F5_DOWN_LEAKED: AtomicU64 = AtomicU64::new(0);
     static F5_DOWN_WAITED_ARMED_LATE: AtomicU64 = AtomicU64::new(0);
     static REMOTE_F5_RAW_OBSERVED: AtomicU64 = AtomicU64::new(0);
+    /// 最后一次"已通过设备归因确认为小米遥控器"的 Raw Input 活动时刻
+    /// （`now_ms` 基准）。只有 `raw_input_windows` 的接受判据通过后才会刷新：
+    /// 实体键盘的 F5 在第 848 行那处 `!accepted` 就被丢弃，走不到这里，
+    /// 因此该时间戳是可靠的"遥控器在场"证据。
+    static LAST_REMOTE_ACTIVITY_MS: AtomicU64 = AtomicU64::new(0);
     /// 遥控器 HID 活动通知（lib.rs 接线到 BleRuntime::wake_reconnect）：
     /// 归因线程观察到遥控器键盘事件时回调。用于断连状态下遥控器醒来
     /// 按键时立即触发重连（HID 先于 GATT 可达，2026-09-05 实证）。
@@ -84,6 +94,14 @@ mod windows_impl {
         SESSION_ACTIVE.load(Ordering::Relaxed)
     }
 
+    /// 最近 [`REMOTE_ACTIVITY_WINDOW_MS`] 内是否观察到遥控器本体的报文。
+    /// 只有 Raw Input 归因成功才刷新（见 `LAST_REMOTE_ACTIVITY_MS` 注释），
+    /// 因此可安全用作 `link_guard` 的前置条件。
+    fn recent_remote_activity() -> bool {
+        let last = LAST_REMOTE_ACTIVITY_MS.load(Ordering::Relaxed);
+        last != 0 && now_ms().saturating_sub(last) < REMOTE_ACTIVITY_WINDOW_MS
+    }
+
     fn swallow_ready() -> bool {
         decide(
             VK_F5,
@@ -92,6 +110,7 @@ mod windows_impl {
             LINK_GUARD_ACTIVE.load(Ordering::Relaxed),
             armed(),
             HOLD_NONE,
+            recent_remote_activity(),
         )
     }
 
@@ -125,6 +144,14 @@ mod windows_impl {
     /// UP 沿只按配对状态裁决（会话/武装不参与）：本次按住的 DOWN 沿全部被
     /// 吞下（hold==HOLD_SWALLOWED_ALL）才吞 UP，防"DOWN 泄漏 + UP 吞下"粘键；
     /// 配对未知（钩子中途启动）与已泄漏一律放行 UP（宁可送孤立 UP，不留粘键）。
+    ///
+    /// DOWN 沿的三个来源，语义各不相同：
+    /// - `session`：ATVV 语音会话活跃，遥控器语音键确实按着，必须吞；
+    /// - `armed_now`：250ms 宽限，由遥控器报文或会话/保护边沿武装，天然带归因；
+    /// - `link_guard`：**建链保护，本身不带归因**。`Reconnecting` 可无限持续，
+    ///   若无条件吞，会把实体键盘 F5 一起吞掉（2026-11-13 现场：遥控器服务
+    ///   发现失败、`attempt=7` 连续重连 3.5 小时，期间键盘 F5 全部失效）。
+    ///   故叠加 `remote_recent`：只有最近观察到遥控器本体报文才允许借用该保护。
     pub fn decide(
         vk_code: u32,
         is_key_up: bool,
@@ -132,6 +159,7 @@ mod windows_impl {
         link_guard: bool,
         armed_now: bool,
         hold_pairing: u32,
+        remote_recent: bool,
     ) -> bool {
         if vk_code != VK_F5 {
             return false;
@@ -139,7 +167,7 @@ mod windows_impl {
         if is_key_up {
             return hold_pairing == HOLD_SWALLOWED_ALL;
         }
-        session || link_guard || armed_now
+        session || armed_now || (link_guard && remote_recent)
     }
 
     /// 纯状态转移：DOWN 沿裁决后更新配对状态。任一 DOWN 沿泄漏（含 typematic
@@ -188,6 +216,7 @@ mod windows_impl {
                     LINK_GUARD_ACTIVE.load(Ordering::Relaxed),
                     armed(),
                     hold,
+                    recent_remote_activity(),
                 );
                 // 功能点日志：F5 边沿级别的吞/放裁决（每语音会话约 2 条），
                 // 首按失败类报障可直接定位"泄漏/等待超时/配对"环节。
@@ -258,6 +287,7 @@ mod windows_impl {
             LINK_GUARD_ACTIVE.store(false, Ordering::Relaxed);
             ARMED_UNTIL_MS.store(0, Ordering::Relaxed);
             HOLD_PAIRING.store(HOLD_NONE, Ordering::Relaxed);
+            LAST_REMOTE_ACTIVITY_MS.store(0, Ordering::Relaxed);
             VoiceKeySuppressor
         }
     }
@@ -280,6 +310,9 @@ mod windows_impl {
     /// typematic 重复沿灌满重连消息队列。
     pub fn observe_remote_voice_f5(wake_reconnect: bool) {
         REMOTE_F5_RAW_OBSERVED.fetch_add(1, Ordering::Relaxed);
+        // 归因已成功（调用方仅在 Raw Input 接受判据通过后转发）：刷新
+        // "遥控器在场"时间戳，供 `link_guard` 期间区分实体键盘 F5。
+        LAST_REMOTE_ACTIVITY_MS.store(now_ms(), Ordering::Relaxed);
         arm_grace();
         if wake_reconnect {
             crate::ble::gatt_note(
@@ -353,15 +386,17 @@ pub use windows_impl::{decide, track_down, HOLD_LEAKED, HOLD_NONE, HOLD_SWALLOWE
 #[cfg(test)]
 mod tests {
     #[test]
-    fn only_armed_session_or_link_guard_f5_down_is_swallowed() {
-        // DOWN 沿：非 F5 一律透传；F5 仅在会话、建链保护或设备归因武装时吞。
+    fn only_armed_session_or_attributed_link_guard_f5_down_is_swallowed() {
+        // DOWN 沿：非 F5 一律透传；F5 在会话、设备归因武装、或"建链保护 + 遥控器
+        // 刚有报文"时吞。
         assert!(!super::decide(
             0x41,
             false,
             false,
             false,
             false,
-            super::HOLD_NONE
+            super::HOLD_NONE,
+            false
         ));
         assert!(!super::decide(
             0x41,
@@ -369,7 +404,8 @@ mod tests {
             true,
             true,
             true,
-            super::HOLD_SWALLOWED_ALL
+            super::HOLD_SWALLOWED_ALL,
+            true
         ));
         assert!(!super::decide(
             0x74,
@@ -377,7 +413,8 @@ mod tests {
             false,
             false,
             false,
-            super::HOLD_NONE
+            super::HOLD_NONE,
+            false
         ));
         assert!(super::decide(
             0x74,
@@ -385,7 +422,8 @@ mod tests {
             true,
             false,
             false,
-            super::HOLD_NONE
+            super::HOLD_NONE,
+            false
         ));
         assert!(super::decide(
             0x74,
@@ -393,7 +431,8 @@ mod tests {
             false,
             true,
             false,
-            super::HOLD_NONE
+            super::HOLD_NONE,
+            true
         ));
         assert!(super::decide(
             0x74,
@@ -401,7 +440,35 @@ mod tests {
             false,
             false,
             true,
-            super::HOLD_NONE
+            super::HOLD_NONE,
+            false
+        ));
+    }
+
+    #[test]
+    fn link_guard_without_remote_activity_never_swallows_physical_f5() {
+        // 2026-11-13 回归：遥控器服务发现失败、`Reconnecting` 持续数小时时，
+        // `link_guard` 长期为 true。此时**没有**遥控器报文（实体键盘按 F5），
+        // 必须放行，否则浏览器刷新/记事本插入时间全部失效。
+        // 反过来，遥控器确实刚发过报文时仍要吞，避免 2026-09-10 修的
+        // "重连窗口 F5 泄漏"回归。
+        assert!(!super::decide(
+            0x74,
+            false,
+            false,
+            true,
+            false,
+            super::HOLD_NONE,
+            false
+        ));
+        assert!(super::decide(
+            0x74,
+            false,
+            false,
+            true,
+            false,
+            super::HOLD_NONE,
+            true
         ));
     }
 
@@ -416,7 +483,8 @@ mod tests {
             false,
             false,
             false,
-            super::HOLD_SWALLOWED_ALL
+            super::HOLD_SWALLOWED_ALL,
+            false
         ));
         assert!(!super::decide(
             0x74,
@@ -424,7 +492,8 @@ mod tests {
             true,
             true,
             true,
-            super::HOLD_LEAKED
+            super::HOLD_LEAKED,
+            true
         ));
         assert!(!super::decide(
             0x74,
@@ -432,7 +501,8 @@ mod tests {
             true,
             true,
             true,
-            super::HOLD_NONE
+            super::HOLD_NONE,
+            true
         ));
         assert!(!super::decide(
             0x41,
@@ -440,7 +510,8 @@ mod tests {
             true,
             true,
             true,
-            super::HOLD_SWALLOWED_ALL
+            super::HOLD_SWALLOWED_ALL,
+            true
         ));
     }
 
